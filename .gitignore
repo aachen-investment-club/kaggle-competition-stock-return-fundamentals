@@ -77,6 +77,11 @@ target/
 
 # Jupyter Notebook
 .ipynb_checkpoints
+data/raw/*.csv
+data/raw/*.zip
+data/processed/*.csv
+data/processed/*.parquet
+submissions/*.csv
 
 # IPython
 profile_default/
