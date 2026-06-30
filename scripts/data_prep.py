@@ -241,3 +241,227 @@ class ArchetypeClusterer:
         X = frame.loc[:, list(ARCHETYPE_FEATURES)]
         Z = self._quantile.transform(self._imputer.transform(X))
         return self._kmeans.predict(Z)
+
+
+# ---------------------------------------------------------------------------
+# Extended features (v2) — adds missingness signals, engineered ratios,
+# and cohort-relative z-scores. See notebook 05 for derivation.
+#
+# Categorization story for new (anonymized) test tickers:
+#   sector_code        - given in CSV
+#   archetype          - assigned by ArchetypeClusterer from fundamentals
+#   relative z-scores  - computed within each frame's own (group × year)
+#                        cohort, using FEATURES only (no labels) -> safe to
+#                        apply transductively to test
+#   missingness flags  - derived from feature presence
+# Every categorization is feature-derived, so it generalizes to strangers.
+# ---------------------------------------------------------------------------
+
+# Buckets used for per-category missingness counts. Splitting the total
+# missing-count by economic meaning gives the model a richer signal than
+# one global count: a row with 5 missing dividend fields is structurally
+# different from one with 5 missing balance-sheet fields.
+FEATURE_CATEGORIES: dict[str, tuple[str, ...]] = {
+    "valuation":   ("pe_ttm", "price_to_book", "price_to_sales", "growth_pe_ratio"),
+    "profit":      ("gross_margin", "operating_margin", "net_margin", "roa", "roe", "rote"),
+    "growth":      ("revenue_growth_3y", "revenue_growth_yoy"),
+    "scale":       ("revenue_ttm", "net_income_ttm", "income_before_tax",
+                    "eps_basic", "eps_diluted", "total_assets",
+                    "stockholders_equity", "current_assets", "current_liabilities",
+                    "long_term_debt", "goodwill", "inventory",
+                    "shares_outstanding", "shares_diluted"),
+    "leverage_liq":("current_ratio", "quick_ratio", "debt_to_equity"),
+    "dividend":    ("dividend_yield", "dividends_ttm", "dividends_paid_ttm"),
+}
+
+# Features that get cohort-relative z-scores. Chosen because they are the
+# textbook drivers of 1-year returns AND because their absolute level means
+# different things across sectors / archetypes (a 30 P/E means something
+# different for SaaS than for utilities).
+RELATIVE_Z_FEATURES: tuple[str, ...] = (
+    "pe_ttm",
+    "price_to_book",
+    "price_to_sales",
+    "net_margin",
+    "roe",
+    "revenue_growth_yoy",
+    "debt_to_equity",
+    "dividend_yield",
+)
+
+
+def add_missingness_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add total + per-category missing counts and a pattern hash.
+
+    `n_missing_total`            single int across all raw features
+    `n_missing_<category>`       per-bucket counts (valuation, profit, ...)
+    `missing_pattern_hash`       int32 hash of the high-NA-field NaN mask;
+                                 same value = same disclosure profile
+    """
+    out = df.copy()
+    raw_cols = [c for cols in FEATURE_CATEGORIES.values() for c in cols]
+    raw_present = [c for c in raw_cols if c in out.columns]
+    out["n_missing_total"] = out[raw_present].isna().sum(axis=1).astype("int16")
+    for cat, cols in FEATURE_CATEGORIES.items():
+        present = [c for c in cols if c in out.columns]
+        if present:
+            out[f"n_missing_{cat}"] = out[present].isna().sum(axis=1).astype("int8")
+
+    pattern_cols = [c for c in MISSINGNESS_FLAG_COLS if c in out.columns]
+    if pattern_cols:
+        # Compact bitmask -> hash. Same mask -> same int, so trees can split
+        # on "disclosure profile == 42" rather than chasing many flag combos.
+        bits = out[pattern_cols].isna().astype(np.uint8).values
+        weights = (1 << np.arange(len(pattern_cols), dtype=np.uint64))
+        out["missing_pattern_hash"] = (bits @ weights).astype("int64") % 999983
+    return out
+
+
+def add_engineered_ratios(df: pd.DataFrame) -> pd.DataFrame:
+    """Add 7 ratios derived from the raw fields.
+
+    All operations are row-wise and use no group statistics, so the function
+    is order-independent and can be applied to train, validation, and test
+    without any fit step.
+    """
+    out = df.copy()
+
+    # earnings_yield = 1 / PE, clipped to ±1 to neutralise tiny-denominator blowups
+    pe = out.get("pe_ttm")
+    if pe is not None:
+        out["earnings_yield"] = np.where(
+            pe.abs() > 1e-6, np.clip(1.0 / pe.replace(0, np.nan), -1.0, 1.0), np.nan
+        )
+
+    # growth acceleration: YoY relative to the 3y average
+    if {"revenue_growth_yoy", "revenue_growth_3y"}.issubset(out.columns):
+        out["accel_growth"] = out["revenue_growth_yoy"] - out["revenue_growth_3y"]
+
+    # asset turnover: how much revenue per dollar of assets
+    if {"revenue_ttm", "total_assets"}.issubset(out.columns):
+        out["asset_turnover"] = out["revenue_ttm"] / out["total_assets"].replace(0, np.nan)
+
+    # gross-to-op gap: high = SG&A / R&D burn between gross and operating line
+    if {"gross_margin", "operating_margin"}.issubset(out.columns):
+        out["gross_to_op_gap"] = out["gross_margin"] - out["operating_margin"]
+
+    # quality composite: NaN-tolerant. We replace NaNs with the within-frame
+    # median before z-scoring so missing components don't blank out the row.
+    def _safe_z(series: pd.Series) -> pd.Series:
+        filled = series.fillna(series.median())
+        std = filled.std()
+        return (filled - filled.mean()) / std if std > 0 else filled * 0.0
+
+    quality_cols = ("net_margin", "roe", "current_ratio")
+    if set(quality_cols).issubset(out.columns) and "debt_to_equity" in out.columns:
+        score = sum(_safe_z(out[c]) for c in quality_cols)
+        score = score - _safe_z(out["debt_to_equity"])
+        out["quality_composite"] = score.astype(float)
+
+    # distress flag: triple-condition binary signal for "operationally fragile"
+    if {"net_margin", "current_ratio", "debt_to_equity"}.issubset(out.columns):
+        out["distress_flag"] = (
+            (out["net_margin"] < 0)
+            & (out["current_ratio"] < 1)
+            & (out["debt_to_equity"] > 2)
+        ).fillna(False).astype("int8")
+
+    # size proxy: log-scale composite of revenue and assets (sign-safe)
+    if {"revenue_ttm", "total_assets"}.issubset(out.columns):
+        out["size_proxy"] = 0.5 * (
+            np.log1p(out["revenue_ttm"].clip(lower=0))
+            + np.log1p(out["total_assets"].clip(lower=0))
+        )
+    return out
+
+
+def add_relative_z_scores(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    features: Iterable[str] = RELATIVE_Z_FEATURES,
+    suffix: str = "z",
+) -> pd.DataFrame:
+    """Add (feature - group_mean) / group_std for each (group_cols) cohort.
+
+    Computed WITHIN the passed frame. For new tickers in the test cohort
+    this means z-scoring against test's own (sector × 2024) distribution,
+    which is leakage-free because z-scoring uses features only, never
+    labels. Train and test each self-normalise within their own year(s);
+    the model learns z-score effects that are stable across regimes.
+
+    Small groups (n < 20) get the global mean/std as a fall-back instead
+    of high-variance per-group estimates.
+    """
+    out = df.copy()
+    for f in features:
+        if f not in out.columns:
+            continue
+        g = out.groupby(group_cols, dropna=False)[f]
+        group_size = g.transform("size")
+        group_mean = g.transform("mean")
+        group_std = g.transform("std")
+        glob_mean = out[f].mean()
+        glob_std = out[f].std()
+
+        mean = np.where(group_size >= 20, group_mean, glob_mean)
+        std = np.where(group_size >= 20, group_std, glob_std)
+        std = np.where(std > 0, std, np.nan)
+
+        out[f"{f}_{suffix}"] = (out[f] - mean) / std
+    return out
+
+
+def build_extended_features(
+    frame: pd.DataFrame, archetype_col: str | None = "archetype"
+) -> pd.DataFrame:
+    """One-call pipeline: base features + missingness + ratios + z-scores.
+
+    Order matters:
+      1. add missingness counts (uses raw NaN mask, must run before any
+         downstream imputation)
+      2. add engineered ratios (depend on raw values)
+      3. base build_features (drops non-feature cols, adds start_year etc.)
+      4. relative z-scores by (sector × start_year), and by
+         (archetype × start_year) if `archetype_col` is given and present.
+
+    The caller is responsible for assigning `archetype` before calling
+    this (typically via ArchetypeClusterer.predict). If `archetype` is not
+    present, the archetype z-scores are simply skipped.
+    """
+    augmented = add_missingness_features(frame)
+    augmented = add_engineered_ratios(augmented)
+
+    # Carry the categorisation columns through so groupby can find them
+    # after build_features drops the non-feature cols.
+    carry = {"sector_code": augmented["sector_code"]}
+    if archetype_col and archetype_col in augmented.columns:
+        carry[archetype_col] = augmented[archetype_col]
+
+    base = build_features(augmented)
+    for k, v in carry.items():
+        base[k] = v.values  # ensure aligned by position
+    if "start_year" not in base.columns:
+        base["start_year"] = augmented["start_year"].values
+
+    base = add_relative_z_scores(
+        base, group_cols=["sector_code", "start_year"], suffix="sect_yr_z"
+    )
+    if archetype_col and archetype_col in base.columns:
+        base = add_relative_z_scores(
+            base, group_cols=[archetype_col, "start_year"], suffix="arc_yr_z"
+        )
+    return base
+
+
+def shrunk_archetype_means(
+    train_archetypes: pd.Series, train_targets: pd.Series, prior: float = 200.0
+) -> pd.Series:
+    """Per-archetype mean, shrunk toward the global mean with `prior`
+    pseudo-observations. Acts as a strong baseline AND a blend partner."""
+    glob = train_targets.mean()
+    stats = (
+        pd.DataFrame({"a": train_archetypes.values, "y": train_targets.values})
+        .groupby("a")["y"]
+        .agg(["mean", "count"])
+    )
+    return (stats["mean"] * stats["count"] + glob * prior) / (stats["count"] + prior)
